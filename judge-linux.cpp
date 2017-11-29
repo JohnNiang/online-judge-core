@@ -23,7 +23,9 @@ using namespace std;
 #define STDIN 0
 #define STDOUT 1
 #define STDERR 2
-#define FPS_WAIT 5000
+#define FPS_WAIT 500 // unit: us
+#define MEMORY_EXCEEDED 1001
+#define TIME_EXCEEDED 1010
 
 #if __WORDSIZE == 64
 #define REG(reg) reg.orig_rax
@@ -31,37 +33,48 @@ using namespace std;
 #define REG(reg) reg.orig_eax
 #endif
 
-void printUsage(FILE *stream, int exitCode);
+void printUsage(ostream &, int);
 void printProgramInfo(int, char **);
 bool createProcess(pid_t &, sigset_t &);
-void setupIoRedirection(const string &, const string &);
+void setupIoRedirection(const string &, const string &, const string &);
 void setupRunUser();
 int runProcess(pid_t, sigset_t, const string &, int, int, int &, int &);
 char **getCommandArgs(const string &);
 bool isCurrentUsedMemoryIgnored(int, int);
-int getMaxUsedMemory(pid_t, int);
 int getCurrentUsedMemory(pid_t);
 long long getMillisecondsNow();
 long killProcess(pid_t &);
-bool isAllowedSystemCalls(int);
 
 /**
  * The name of this program
  */
-const char *program_name;
+const char *program_name = nullptr;
+
+// Whether to display verbose messages.
+int verbose = 0;
 
 struct JudgeResult
 {
+    int usedTime;
+    int usedMemory;
+    int exitCode;
+    void printResult()
+    {
+        cout << "{\"usedTime\":" << usedTime << ",";
+        cout << "\"usedMemory\": " << usedMemory << ",";
+        cout << "\"exitCode\":" << exitCode << "}";
+    }
 };
 
 const struct option longOptions[] = {
-    {"help", 0, NULL, 'h'},
-    {"command_line", 1, NULL, 'C'},
-    {"time_limit", 1, NULL, 'T'},
-    {"memory_limit", 1, NULL, 'M'},
-    {"input_file_path", 1, NULL, 'I'},
-    {"output_file_path", 1, NULL, 'O'},
-    {"verbose", 0, NULL, 'v'},
+    {"help", no_argument, NULL, 'h'},
+    {"command_line", required_argument, NULL, 'C'},
+    {"time_limit", required_argument, NULL, 'T'},
+    {"memory_limit", required_argument, NULL, 'M'},
+    {"input_file_path", required_argument, NULL, 'I'},
+    {"output_file_path", required_argument, NULL, 'O'},
+    {"error_file_path", required_argument, NULL, 'E'},
+    {"verbose", no_argument, NULL, 'v'},
     {NULL, 0, NULL, 0} // Required at end of the array.
 };
 
@@ -69,26 +82,17 @@ int main(int argc, char *argv[], char **env)
 {
     int nextOption = 0;
 
-    const char *const shortOptions = "hT:M:I:O:v";
-
-    // The name of the file to receive program output, or NULL for standard ouptut.
-    const char *output_filename = NULL;
-
-    // Whether to display verbose messages.
-    int verbose = 0;
+    const char *const shortOptions = "hC:T:M:I:O:E:v";
 
     // Remember the name of the program, to incorporate in messages.
     program_name = argv[0];
 
-    string commandLine = "java";
-    string inputFilePath = "";
-    string outputFilePath = "";
-    int timeLimit = 1001;    // ms
-    int memoryLimit = 32768; // KB
-
-    int usedTime = 0;
-    int usedMemory = 0;
-    int exitCode = 127;
+    string commandLine = "";    // 运行源程序的命令
+    string inputFilePath = "";  // 标准输入文件路径
+    string outputFilePath = ""; // 标准输出文件路径
+    string errorFilePath = "";  // 标准错误输出文件路径
+    int timeLimit = 0;          // ms
+    int memoryLimit = 0;        // KB
 
     do
     {
@@ -96,23 +100,30 @@ int main(int argc, char *argv[], char **env)
         switch (nextOption)
         {
         case 'h':
-            printUsage(stdout, 0);
+            printUsage(cout, 0);
         case 'C':
-            
+            commandLine = optarg;
             break;
         case 'T':
+            timeLimit = atoi(optarg);
             break;
         case 'M':
+            memoryLimit = atoi(optarg);
             break;
         case 'I':
+            inputFilePath = optarg;
             break;
         case 'O':
+            outputFilePath = optarg;
+            break;
+        case 'E':
+            errorFilePath = optarg;
             break;
         case 'v':
             verbose = 1;
             break;
         case '?': // The user specified an invalid option.
-            printUsage(stderr, 1);
+            printUsage(cerr, 1);
         case -1: // Done with options.
             break;
         default: // Something else: unexpected.
@@ -121,42 +132,37 @@ int main(int argc, char *argv[], char **env)
     } while (nextOption != -1);
 
     if (verbose)
-    {
         printProgramInfo(argc, argv);
-    }
 
     pid_t pid = -1;
     sigset_t sigset;
 
     bool rst = createProcess(pid, sigset);
-    cout << "[DEBUG] create process return: " << rst << ", pid: " << pid << endl;
+    if (verbose)
+        cout << "[DEBUG] create process return: " << rst << ", pid: " << pid << endl;
 
     // Setup I/O Redirection for Child Process
     if (pid == 0)
     {
         // setupRunUser();
-        setupIoRedirection(inputFilePath, outputFilePath);
+        setupIoRedirection(inputFilePath, outputFilePath, errorFilePath);
     }
-
-    exitCode = runProcess(pid, sigset, commandLine, timeLimit, memoryLimit, usedTime, usedMemory);
-
-    cout << "[DEBUG] usedTime  : " << usedTime << " ms" << endl;
-    cout << "[DEBUG] usedMemory: " << usedMemory << " KB" << endl;
-    cout << "[DEBUG] exitCode  : " << exitCode << endl;
-    return exitCode;
+    JudgeResult result = {0, 0, 127};
+    result.exitCode = runProcess(pid, sigset, commandLine, timeLimit, memoryLimit, result.usedTime, result.usedMemory);
+    result.printResult();
+    return 0;
 }
 
-void printUsage(FILE *stream, int exitCode)
+void printUsage(ostream &stream, int exitCode)
 {
-    fprintf(stream, "Usage: %s options [ inputfile ... ]\n", program_name);
-    fprintf(stream,
-            "   -h  --help              Display this usage infomation.\n"
-            "   -C  --command_line      Command Line to run the program.\n"
-            "   -T  --time_limit        Time Limit.\n"
-            "   -M  --memory_limit      Memory Limit.\n"
-            "   -I  --input_file_path   Standard input file path.\n"
-            "   -O  --output_file_path  Output file path.\n"
-            "   -v  --verbose           Print verbose messages.\n");
+    stream << "Usage: " << program_name << " options [ C T M I O ]" << endl;
+    stream << "   -h  --help              Display this usage infomation." << endl;
+    stream << "   -C  --command_line      Command Line to run the program." << endl;
+    stream << "   -T  --time_limit        Time Limit." << endl;
+    stream << "   -M  --memory_limit      Memory Limit." << endl;
+    stream << "   -I  --input_file_path   Standard input file path." << endl;
+    stream << "   -O  --output_file_path  Output file path." << endl;
+    stream << "   -v  --verbose           Print verbose messages." << endl;
     exit(exitCode);
 }
 
@@ -171,8 +177,9 @@ void printProgramInfo(int argc, char **argv)
         cout << "The arguments are:" << endl;
         while (*(++argvPtr))
         {
-            cout << "\t" << *argvPtr << endl;
+            cout << "\t" << *argvPtr;
         }
+        cout << endl;
     }
 }
 
@@ -201,7 +208,7 @@ bool createProcess(pid_t &pid, sigset_t &sigset)
  * @param  inputFilePath  - 执行程序时的输入文件路径(可为NULL)
  * @param  outputFilePath - 执行程序后的输出文件路径(可为NULL)
  */
-void setupIoRedirection(const string &inputFilePath, const string &outputFilePath)
+void setupIoRedirection(const string &inputFilePath, const string &outputFilePath, const string &errorFilePath)
 {
     if (inputFilePath != "")
     {
@@ -215,8 +222,14 @@ void setupIoRedirection(const string &inputFilePath, const string &outputFilePat
         int outputFileDescriptor = open(outputFilePath.c_str(), O_CREAT | O_WRONLY, 0644);
         chmod(outputFilePath.c_str(), S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
         dup2(outputFileDescriptor, STDOUT);
-        dup2(outputFileDescriptor, STDERR);
         close(outputFileDescriptor);
+    }
+    if (errorFilePath != "")
+    {
+        int errorFileDescriptor = open(errorFilePath.c_str(), O_CREAT | O_WRONLY, 0644);
+        chmod(errorFilePath.c_str(), S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+        dup2(errorFileDescriptor, STDERR);
+        close(errorFileDescriptor);
     }
 }
 
@@ -226,17 +239,20 @@ void setupRunUser()
     uid_t uid = 1005;
     while (setgid(gid) != 0)
     {
-        cout << "[WARN] setgid(" << gid << ") failed." << endl;
+        if (verbose)
+            cout << "[WARN] setgid(" << gid << ") failed." << endl;
         sleep(1);
     }
     while (setuid(uid) != 0)
     {
-        cout << "[WARN] setuid(" << uid << ") failed." << endl;
+        if (verbose)
+            cout << "[WARN] setuid(" << uid << ") failed." << endl;
         sleep(1);
     }
     while (setresuid(uid, uid, uid) != 0)
     {
-        cout << "[WARN] setresuid(" << uid << ", " << uid << ", " << uid << ") failed." << endl;
+        if (verbose)
+            cout << "[WARN] setresuid(" << uid << ", " << uid << ", " << uid << ") failed." << endl;
         sleep(1);
     }
 }
@@ -263,7 +279,6 @@ int runProcess(pid_t pid, sigset_t sigset, const string &commandLine, int timeLi
     // Run child process
     if (pid == 0)
     {
-        // ptrace(PTRACE_TRACEME, 0, NULL, NULL);
         execvp(argv[0], argv);
     }
     // Setup Monitor in Parent Process
@@ -271,18 +286,22 @@ int runProcess(pid_t pid, sigset_t sigset, const string &commandLine, int timeLi
     {
         startTime = getMillisecondsNow();
         long times = 0;
+        // recalculate the timt limit :timelimit = timlimit + 20ms
+        timeLimit = timeLimit + 100;
         while (waitpid(pid, &exitCode, WNOHANG) != -1)
         {
             // usleep(5000);
             times++;
             // sleep(FPS_WAIT);
-            usleep(FPS_WAIT);
+            usleep(FPS_WAIT + log(times));
             // Check time limit
             endTime = getMillisecondsNow();
             usedTime = endTime - startTime;
-            if (usedTime > timeLimit * 1.5)
+            if (usedTime > timeLimit)
             {
+                // Exceeded Time
                 killProcess(pid);
+                exitCode = TIME_EXCEEDED;
                 break;
             }
 
@@ -296,31 +315,14 @@ int runProcess(pid_t pid, sigset_t sigset, const string &commandLine, int timeLi
             if (memoryLimit != 0 && currentUsedMemory > memoryLimit &&
                 !isCurrentUsedMemoryIgnored(currentUsedMemory, memoryLimit))
             {
+                // Exceeded Memory
                 killProcess(pid);
+                exitCode = MEMORY_EXCEEDED;
                 break;
             }
-
-            // // Detect system calls
-            // if (memoryLimit != 0)
-            // {
-            //     struct user_regs_struct regs;
-            //     ptrace(PTRACE_GETREGS, pid, NULL, &regs);
-            //     if (REG(regs) >= 0 && REG(regs) <= 328 &&
-            //         !isAllowedSystemCalls(REG(regs)))
-            //     {
-            //         cout << "[DEBUG] System call " << REG(regs) << " is detected." << endl;
-            //         killProcess(pid);
-            //         return 127;
-            //     }
-            //     ptrace(PTRACE_SYSCALL, pid, NULL, NULL);
-            // }
-
-            // if (WIFSTOPPED(exitCode) && WSTOPSIG(exitCode) == SIGTRAP)
-            // {
-            //     ptrace(PTRACE_CONT, pid, NULL, NULL);
-            // }
         }
-        cout << "[DEBUG] loop times: " << times << endl;
+        if (verbose)
+            cout << "[DEBUG] loop times: " << times << endl;
     }
 
     return exitCode;
@@ -430,23 +432,10 @@ int getCurrentUsedMemory(pid_t pid)
  */
 long killProcess(pid_t &pid)
 {
-    cout << "[DEBUG]"
-         << "Process [PID = " << pid << "] is going to be killled." << endl;
+
+    if (verbose)
+        cout << "[DEBUG] Process [PID = " << pid << "] is going to be killled." << endl;
 
     ptrace(PTRACE_KILL, pid, NULL, NULL);
     return kill(pid, SIGKILL);
-}
-
-/**
- * 检查系统调用是否被允许
- * Ref: 
- * - http://blog.rchapman.org/posts/Linux_System_Call_Table_for_x86_64/
- * 
- * @param systemCallId - 系统调用的ID
- * @return 系统调用是否被允许
- */
-bool isAllowedSystemCalls(int systemCallId)
-{
-    // TODO 完成检测
-    return true;
 }
